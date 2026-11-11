@@ -31,3 +31,6 @@ tmp/
 # Betriebssystem
 .DS_Store
 Thumbs.db
+
+# Details
+README-ClamAV-Tray.md
