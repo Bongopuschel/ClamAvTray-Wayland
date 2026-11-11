@@ -1,0 +1,17 @@
+ClamAV Tray (inoffizielles lokales Paket)
+
+Der Java-Anwendungscode und das Paket-Build-Skript sind ein Projektbeispiel.
+
+ClamAV Logo: Cisco Talos / ClamAV-Projekt, GPL-2.0.
+Quelle: https://github.com/Cisco-Talos/clamav/blob/main/logo.png
+
+libtray: Kitty-Hivens, Apache-2.0.
+Quelle: https://github.com/Kitty-Hivens/libtray
+Die lokal angepassten Quelltexte liegen unter libtray_reference/.
+
+OpenJDK: GPL-2.0 mit Classpath Exception und weiteren Komponentenlizenzen.
+Die durch jlink in das Paket eingefuegte Laufzeit enthaelt ihre Lizenztexte
+im Verzeichnis /usr/lib/clamav-tray/runtime/legal/.
+
+ClamAV wird nicht mitgeliefert, sondern von den offiziellen Debian-Paketen
+als Systemabhaengigkeit installiert.

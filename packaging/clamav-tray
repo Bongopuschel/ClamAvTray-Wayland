@@ -1,0 +1,5 @@
+#!/bin/sh
+# Startet immer die mitgelieferte Java-Laufzeit; kein systemweites JDK nötig.
+exec /usr/lib/clamav-tray/runtime/bin/java \
+    --enable-native-access=ALL-UNNAMED \
+    -jar /usr/lib/clamav-tray/clamav-tray.jar "$@"

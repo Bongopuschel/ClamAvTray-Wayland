@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=ClamAV Tray
+Comment=Statusanzeige und manueller Virenscan mit ClamAV
+Exec=clamav-tray
+Icon=clamav-tray
+Terminal=false
+Categories=Utility;Security;
+OnlyShowIn=KDE;
+StartupNotify=false
+X-KDE-autostart-after=panel

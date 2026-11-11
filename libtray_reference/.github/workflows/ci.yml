@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  JAVA_VERSION: '22'
+  JAVA_DISTRIBUTION: 'temurin'
+  GRAALVM_VERSION: '25'
+  GRAALVM_DISTRIBUTION: 'graalvm-community'
+
+jobs:
+  build:
+    # `check` covers each platform beyond the unit tests: on Linux the SNI
+    # backend runs against a private session bus with the test as tray host
+    # (sniHostTest), on macOS a status item is created, driven and closed
+    # (macSmokeCheck), and on Windows the Win32 tests post the tray window
+    # the shell's callbacks.
+    name: Build & test (${{ matrix.name }})
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-latest
+          - name: Windows
+            os: windows-latest
+          - name: macOS
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+      - uses: gradle/actions/setup-gradle@v6
+      # sniHostTest skips itself without dbus-daemon. Fail here instead, so
+      # the end-to-end tests cannot quietly stop running in CI.
+      - name: Require dbus-daemon
+        if: runner.os == 'Linux'
+        run: command -v dbus-daemon
+      - name: Build + test
+        run: ./gradlew build --stacktrace
+      # Reports what Tray.create does next to AWT, for reading in the log. Allowed
+      # to fail because a hang is one of the answers it is looking for.
+      - name: Probe Tray.create next to AWT
+        if: runner.os == 'macOS'
+        continue-on-error: true
+        run: ./gradlew macAwtProbe macAwtProbeFirstThread --continue --stacktrace
+      - name: Upload test reports on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-reports-${{ matrix.name }}
+          path: build/reports/tests
+          retention-days: 7
+
+  native:
+    # The platform's check program built as a GraalVM native image against the
+    # library jar and its metadata, then run, which is what a consumer's native
+    # build sees. Catches a foreign call or upcall target added without
+    # metadata before it reaches a release.
+    name: Native image (${{ matrix.name }})
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-latest
+          - name: Windows
+            os: windows-latest
+          - name: macOS
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: graalvm/setup-graalvm@v1
+        with:
+          java-version: ${{ env.GRAALVM_VERSION }}
+          distribution: ${{ env.GRAALVM_DISTRIBUTION }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: gradle/actions/setup-gradle@v6
+      - name: Require dbus-daemon
+        if: runner.os == 'Linux'
+        run: command -v dbus-daemon
+      # The tracing agent's view of the same program on the JVM, for updating
+      # the platform-specific JDK entries in the shipped metadata.
+      - name: Record with the native-image agent
+        run: ./gradlew nativeAgentRun --stacktrace
+      - name: Build and run the native check
+        run: ./gradlew nativeCheck --stacktrace
+      - name: Upload the agent output
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-agent-${{ matrix.name }}
+          path: build/native-agent
+          retention-days: 7

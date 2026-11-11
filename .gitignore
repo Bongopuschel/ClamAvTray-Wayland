@@ -1,0 +1,33 @@
+# Maven
+target/
+
+# Gradle
+.gradle/
+**/.gradle/
+**/build/
+
+# Debian-Pakete
+dist/
+*.deb
+
+# Java
+*.class
+hs_err_pid*
+
+# IDE
+.idea/
+.vscode/
+.settings/
+.classpath
+.project
+
+# Temporäre Dateien
+tmp/
+*.log
+*.tmp
+*.swp
+*~
+
+# Betriebssystem
+.DS_Store
+Thumbs.db

@@ -1,0 +1,463 @@
+import java.util.concurrent.TimeUnit
+
+plugins {
+    alias(libs.plugins.kotlin.jvm)
+    `java-library`
+    // vanniktech: applies maven-publish + signing, targets the new Central
+    // Portal. Replaces the bare `maven-publish` + hand-rolled publishing block.
+    alias(libs.plugins.mavenPublish)
+    // Declared so the `signing { }` type-safe accessor + useGpgCmd() resolve
+    // (vanniktech applies signing transitively, but that doesn't generate the
+    // Kotlin DSL accessor for this script). Idempotent.
+    `signing`
+}
+
+val osName = System.getProperty("os.name").lowercase()
+// Looked up on PATH, where ProcessBuilder in PrivateSessionBus finds it too, so
+// a host with dbus-daemon outside /usr/bin (NixOS) still gets a private bus
+// instead of the desktop's.
+val linuxWithDbus = osName.contains("linux") &&
+    providers.environmentVariable("PATH").orElse("").get().split(File.pathSeparator)
+        .any { File(it, "dbus-daemon").canExecute() }
+
+// SmokeMain lives in the TEST source set (src/test) so it stays OUT of the
+// published library jar yet keeps `internal` access to the backends (the macOS
+// smoke loop reaches ObjcBindings, which a plain custom source set could not
+// see -- Kotlin only friend-paths the test compilation). The test runtime
+// classpath already carries the slf4j-simple binding (testRuntimeOnly), so
+// runSmoke reuses it rather than a dedicated configuration.
+tasks.register<JavaExec>("runSmoke") {
+    group = "verification"
+    description = "Open a tray icon and print click events. Ctrl-C to exit."
+    classpath = sourceSets.test.get().runtimeClasspath
+    mainClass.set("dev.hivens.libtray.SmokeMainKt")
+    jvmArgs("--enable-native-access=ALL-UNNAMED")
+    // macOS pins NSStatusItem (and every NSWindow constructor it
+    // delegates to) to OS thread 0 — the actual process main thread.
+    // Without `-XstartOnFirstThread`, the JVM main thread runs on a
+    // worker thread that AppKit refuses with
+    //   *** NSInternalInconsistencyException: NSWindow should only
+    //       be instantiated on the main thread!
+    // AWT EDT also doesn't fit — it's a separate thread spawned by
+    // CocoaToolkit. The flag makes JVM main == OS thread 0 == AppKit
+    // main thread, so libtray's calls land where Cocoa wants them.
+    if (osName.contains("mac")) {
+        jvmArgs("-XstartOnFirstThread")
+    }
+    // Show INFO-level logs so the smoke harness surfaces backend
+    // diagnostics ("window class registered", "NIM_ADD succeeded",
+    // GetLastError on failure paths). Default slf4j-simple level is INFO
+    // already, but the system property makes the intent explicit and
+    // future-proofs against the default flipping in a newer release.
+    systemProperty("org.slf4j.simpleLogger.defaultLogLevel", "info")
+    systemProperty("org.slf4j.simpleLogger.showDateTime", "true")
+    systemProperty("org.slf4j.simpleLogger.dateTimeFormat", "HH:mm:ss.SSS")
+    standardInput = System.`in`
+    // Don't fail the build if a developer aborts the smoke with Ctrl-C —
+    // SIGINT exits the JVM with code 130, JavaExec treats that as failure.
+    isIgnoreExitValue = true
+}
+
+// JavaFX repro harness for issue #5 (macOS tray crash inside a JavaFX
+// host). Isolated source set so JavaFX never reaches the published
+// artifact, the main compile, or the test classpath. JavaFX artifacts are
+// platform-classified, so pick the classifier matching whoever runs the
+// task (only macOS actually reproduces #5; other OSes just sanity-check
+// JavaFX/libtray coexistence).
+val javafxVersion = "25.0.3"
+val javafxClassifier: String = run {
+    val aarch64 = System.getProperty("os.arch").lowercase() in setOf("aarch64", "arm64")
+    when {
+        osName.contains("mac") || osName.contains("darwin") -> if (aarch64) "mac-aarch64" else "mac"
+        osName.contains("win") -> if (aarch64) "win-aarch64" else "win"
+        else -> if (aarch64) "linux-aarch64" else "linux"
+    }
+}
+
+val javafxSmoke: SourceSet = sourceSets.create("javafxSmoke") {
+    compileClasspath += sourceSets.main.get().output
+    runtimeClasspath += sourceSets.main.get().output
+}
+
+dependencies {
+    "javafxSmokeImplementation"(libs.slf4j.api)
+    "javafxSmokeRuntimeOnly"(libs.slf4j.simple)
+    listOf("javafx-base", "javafx-graphics").forEach { module ->
+        "javafxSmokeImplementation"("org.openjfx:$module:$javafxVersion:$javafxClassifier")
+    }
+}
+
+tasks.register<JavaExec>("runJavaFxSmoke") {
+    group = "verification"
+    description = "Issue #5 repro: create a libtray tray inside a live JavaFX host (macOS-focused)."
+    classpath = javafxSmoke.runtimeClasspath
+    mainClass.set("dev.hivens.libtray.JavaFxSmokeMainKt")
+    jvmArgs("--enable-native-access=ALL-UNNAMED")
+    // JavaFX manages its own main-thread acquisition on macOS, so unlike
+    // runSmoke we do NOT force -XstartOnFirstThread by default (matches a
+    // normal JavaFX launch). If JavaFX refuses to start on a given host
+    // complaining about the main thread, retry with `-PfxFirstThread`.
+    if (project.hasProperty("fxFirstThread") && osName.contains("mac")) {
+        jvmArgs("-XstartOnFirstThread")
+    }
+    // Force JavaFX's software render pipeline. JavaFX 25 defaults to Metal
+    // on macOS, which cannot initialise on a GPU-less host: a QEMU macOS
+    // VM dies in MTLContext_nInitialize ("Failed to create shader
+    // library") before any tray code runs. The #5 crash lives in Glass's
+    // CVDisplayLink pulse timer, independent of the render backend, so
+    // software rendering keeps the repro valid while letting JavaFX start
+    // anywhere (VM, CI, headless).
+    systemProperty("prism.order", "sw")
+    systemProperty("org.slf4j.simpleLogger.defaultLogLevel", "info")
+    systemProperty("org.slf4j.simpleLogger.showDateTime", "true")
+    systemProperty("org.slf4j.simpleLogger.dateTimeFormat", "HH:mm:ss.SSS")
+    standardInput = System.`in`
+    isIgnoreExitValue = true
+}
+
+group = "dev.hivens"
+// Version comes from the git tag at CI time via `-PappVersion=<tag>`;
+// falls back to `git describe` for local development.
+version = providers.gradleProperty("appVersion")
+    .orElse(providers.exec {
+        commandLine("git", "describe", "--tags", "--always", "--dirty")
+        isIgnoreExitValue = true
+    }.standardOutput.asText.map { it.trim().ifEmpty { "0.0.0-SNAPSHOT" } })
+    .getOrElse("0.0.0-SNAPSHOT")
+
+java {
+    // Source / target Java 22 — Project Panama (java.lang.foreign)
+    // finalized as JEP 454. Compiles with any JDK >= 22 in the build
+    // environment; CI uses Temurin 22, the maintainer's local install
+    // is JBR 25 (compatible). No toolchain auto-provision plugin —
+    // contributors install their own JDK rather than have Gradle
+    // download one transparently.
+    sourceCompatibility = JavaVersion.VERSION_22
+    targetCompatibility = JavaVersion.VERSION_22
+    // No withSourcesJar()/withJavadocJar() here -- the vanniktech plugin
+    // builds and publishes the sources + javadoc jars itself; declaring
+    // them again would double-register the artifacts.
+}
+
+kotlin {
+    compilerOptions {
+        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_22)
+        // Project Panama (java.lang.foreign) is finalized in JDK 22 — no
+        // --enable-preview needed.
+        freeCompilerArgs.addAll(
+            "-jvm-default=enable",  // Generate Java 8+ default methods for interface APIs.
+        )
+    }
+}
+
+dependencies {
+    // SLF4J only — consumers wire their own backend. The library logs at
+    // DEBUG/INFO/WARN; nothing should fire at ERROR in normal operation
+    // (failures degrade by returning null/false, not by throwing).
+    api(libs.slf4j.api)
+
+    testImplementation(platform("org.junit:junit-bom:${libs.versions.junit.get()}"))
+    testImplementation(libs.junit.jupiter)
+    testRuntimeOnly(libs.junit.platform.launcher)
+    testRuntimeOnly(libs.slf4j.simple)
+    testImplementation(libs.kotest.assertions)
+}
+
+// End-to-end Linux tests in which the test plays the tray host. They run on
+// a private session bus from PrivateSessionBus below, so a desktop's real
+// tray host neither sees the test items nor holds the watcher name the tests
+// take. Skipped where dbus-daemon is not available.
+abstract class PrivateSessionBus : BuildService<BuildServiceParameters.None>, AutoCloseable {
+    private val daemon: Process = ProcessBuilder("dbus-daemon", "--session", "--nofork", "--print-address=1")
+        .redirectError(ProcessBuilder.Redirect.INHERIT)
+        .start()
+
+    val address: String = daemon.inputStream.bufferedReader().readLine()
+        ?: error("dbus-daemon exited without printing an address")
+
+    /** For tests that stop the daemon to make it stop reading its sockets. */
+    val pid: Long get() = daemon.pid()
+
+    override fun close() {
+        daemon.destroy()
+        // A daemon left stopped by a test that died between SIGSTOP and SIGCONT
+        // never handles the SIGTERM above.
+        if (!daemon.waitFor(2, TimeUnit.SECONDS)) daemon.destroyForcibly()
+    }
+}
+
+// One user at a time: sniHostTest, nativeCheck and nativeAgentRun each run a
+// watcher on this bus, which only one can own, and sniHostTest stops the daemon
+// in one of its tests. With the configuration cache, tasks of this project can
+// otherwise run in parallel.
+val privateSessionBus = gradle.sharedServices.registerIfAbsent("privateSessionBus", PrivateSessionBus::class) {
+    maxParallelUsages.set(1)
+}
+
+// A bus of its own for the test task, which can run in parallel with
+// sniHostTest. That task stops its daemon to test a bus that stops reading,
+// and runs a watcher that would pick up the test task's trays as well.
+val testSessionBus = gradle.sharedServices.registerIfAbsent("testSessionBus", PrivateSessionBus::class) {}
+
+tasks.test {
+    useJUnitPlatform {
+        excludeTags("sni-host")
+    }
+    // List every test with its outcome, so a CI log shows which platform
+    // tests ran and which skipped themselves on that runner.
+    testLogging {
+        events("passed", "skipped", "failed")
+    }
+    // The backends' native calls need this. Harmless on tests that don't
+    // reach Panama.
+    jvmArgs("--enable-native-access=ALL-UNNAMED")
+    // TrayFactoryTest creates a real tray, which must not show up on a
+    // developer's desktop.
+    if (linuxWithDbus) {
+        usesService(testSessionBus)
+        val bus = testSessionBus
+        doFirst {
+            (this as Test).environment("DBUS_SESSION_BUS_ADDRESS", bus.get().address)
+        }
+    } else if (osName.contains("linux")) {
+        // No dbus-daemon to start a private bus with. An address nothing listens
+        // on makes Tray.create return null, where inheriting the variable would
+        // put the test tray on the desktop.
+        environment("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent/libtray-test-bus")
+    }
+}
+
+val sniHostTest = tasks.register<Test>("sniHostTest") {
+    group = "verification"
+    description = "Run the SNI backend against a private session bus, with the test as tray host."
+    testClassesDirs = sourceSets.test.get().output.classesDirs
+    classpath = sourceSets.test.get().runtimeClasspath
+    useJUnitPlatform {
+        includeTags("sni-host")
+    }
+    jvmArgs("--enable-native-access=ALL-UNNAMED")
+    testLogging {
+        showStandardStreams = true
+    }
+    usesService(privateSessionBus)
+    val bus = privateSessionBus
+    doFirst {
+        (this as Test).environment("DBUS_SESSION_BUS_ADDRESS", bus.get().address)
+        environment("LIBTRAY_PRIVATE_BUS", "1")
+        environment("LIBTRAY_PRIVATE_BUS_PID", bus.get().pid.toString())
+    }
+    val available = linuxWithDbus
+    onlyIf("Linux with dbus-daemon") { available }
+}
+
+// Non-interactive macOS check: create, update, fire a menu item, close from
+// another thread. A program rather than a test because the status item has
+// to be created on the Cocoa main thread. Skipped off macOS.
+val macSmokeCheck = tasks.register<JavaExec>("macSmokeCheck") {
+    group = "verification"
+    description = "Create, drive and close a macOS status item without user input."
+    classpath = sourceSets.test.get().runtimeClasspath
+    mainClass.set("dev.hivens.libtray.macos.MacSmokeCheckKt")
+    jvmArgs("--enable-native-access=ALL-UNNAMED", "-XstartOnFirstThread")
+    val isMac = osName.contains("mac")
+    onlyIf("macOS") { isMac }
+}
+
+// What Tray.create does next to AWT on macOS, which is what a Compose or Swing
+// app runs into. Reports only, see MacAwtProbe. Run with and without the flag
+// the backend's log recommends, since an app can only pick one. Not part of
+// check: CI runs these on macOS without letting them fail the build.
+listOf(
+    "macAwtProbe" to emptyList(),
+    "macAwtProbeFirstThread" to listOf("-XstartOnFirstThread"),
+).forEach { (taskName, extraArgs) ->
+    tasks.register<JavaExec>(taskName) {
+        group = "verification"
+        description = "Report what Tray.create returns next to AWT, JVM flags: $extraArgs."
+        classpath = sourceSets.test.get().runtimeClasspath
+        mainClass.set("dev.hivens.libtray.macos.MacAwtProbeKt")
+        jvmArgs(listOf("--enable-native-access=ALL-UNNAMED") + extraArgs)
+        val isMac = osName.contains("mac")
+        onlyIf("macOS") { isMac }
+    }
+}
+
+// GraalVM native-image check: the platform's check program built as a native
+// image against the library jar, then run. This is what a consumer's native
+// build sees, so a missing foreign call or upcall target or a packaging
+// mistake fails here instead. The only metadata besides the jar's is what the
+// macOS check's own CoreGraphics calls need, under the test resources. Needs
+// GraalVM: GRAALVM_HOME, or a GraalVM JAVA_HOME. Not part of check, since an
+// image takes a few minutes to build.
+val nativeCheckMain = when {
+    osName.contains("linux") -> "dev.hivens.libtray.linux.LinuxNativeCheckKt"
+    osName.contains("mac") -> "dev.hivens.libtray.macos.MacSmokeCheckKt"
+    osName.contains("windows") -> "dev.hivens.libtray.windows.WindowsNativeCheckKt"
+    else -> null
+}
+val graalHome = providers.environmentVariable("GRAALVM_HOME").orElse(providers.environmentVariable("JAVA_HOME"))
+val nativeCheckImage = layout.buildDirectory.file(
+    if (osName.contains("windows")) "native-check/libtray-check.exe" else "native-check/libtray-check",
+)
+
+// What the check programs run on, without the test frameworks, whose jars may
+// carry native-image metadata of their own.
+val nativeCheckRuntime: Configuration = configurations.create("nativeCheckRuntime") {
+    extendsFrom(configurations.runtimeClasspath.get())
+}
+
+dependencies {
+    nativeCheckRuntime(libs.slf4j.simple)
+}
+
+val nativeCheckBuild = tasks.register<Exec>("nativeCheckBuild") {
+    group = "verification"
+    description = "Build this platform's check program as a GraalVM native image."
+    dependsOn(tasks.testClasses)
+    // Locals, not script-level vals: the configuration cache cannot carry
+    // references to the build script object into a task action.
+    val classpath = files(tasks.jar, sourceSets.test.get().output, nativeCheckRuntime)
+    val image = nativeCheckImage
+    val home = graalHome
+    val main = nativeCheckMain
+    val windows = osName.contains("windows")
+    inputs.files(classpath)
+    inputs.property("graalvmHome", home.orElse(""))
+    // The whole directory: the build writes libawt and its companions next to
+    // the executable, and a missing one has to trigger a rebuild.
+    outputs.dir(layout.buildDirectory.dir("native-check"))
+    onlyIf("a check program for this OS") { main != null }
+    doFirst {
+        val homeDir = home.orNull ?: throw GradleException("neither GRAALVM_HOME nor JAVA_HOME is set, point GRAALVM_HOME at a GraalVM")
+        val nativeImage = File(homeDir, if (windows) "bin/native-image.cmd" else "bin/native-image")
+        check(nativeImage.exists()) { "no native-image at $nativeImage, set GRAALVM_HOME to a GraalVM" }
+        (this as Exec).commandLine(
+            nativeImage.absolutePath,
+            "--enable-native-access=ALL-UNNAMED",
+            "-cp", classpath.asPath,
+            "-o", image.get().asFile.absolutePath.removeSuffix(".exe"),
+            checkNotNull(main),
+        )
+    }
+}
+
+val nativeCheck = tasks.register<Exec>("nativeCheck") {
+    group = "verification"
+    description = "Run this platform's check program as a GraalVM native image."
+    dependsOn(nativeCheckBuild)
+    val main = nativeCheckMain
+    onlyIf("a check program for this OS") { main != null }
+    val image = nativeCheckImage
+    usesService(privateSessionBus)
+    val bus = privateSessionBus
+    val linux = osName.contains("linux")
+    val dbusAvailable = linuxWithDbus
+    doFirst {
+        (this as Exec).commandLine(image.get().asFile.absolutePath)
+        if (linux) {
+            check(dbusAvailable) { "the Linux check needs dbus-daemon on PATH for a private session bus" }
+            environment("DBUS_SESSION_BUS_ADDRESS", bus.get().address)
+        }
+    }
+}
+
+// The same check program on the JVM under the GraalVM tracing agent, writing
+// what it observed to build/native-agent. The JDK entries for AWT and ImageIO
+// differ per platform, and this is how they are recorded on each one. CI
+// uploads the output. Run with a GraalVM as the Gradle JVM.
+tasks.register<JavaExec>("nativeAgentRun") {
+    group = "verification"
+    description = "Run this platform's check program on the JVM under the native-image agent."
+    val main = nativeCheckMain
+    onlyIf("a check program for this OS") { main != null }
+    classpath = sourceSets.test.get().runtimeClasspath
+    mainClass.set(main ?: "none")
+    val output = layout.buildDirectory.dir("native-agent").get().asFile.absolutePath
+    jvmArgs("--enable-native-access=ALL-UNNAMED", "-agentlib:native-image-agent=config-output-dir=$output")
+    if (osName.contains("mac")) jvmArgs("-XstartOnFirstThread")
+    usesService(privateSessionBus)
+    val bus = privateSessionBus
+    val linux = osName.contains("linux")
+    val dbusAvailable = linuxWithDbus
+    doFirst {
+        if (linux) {
+            check(dbusAvailable) { "the Linux check needs dbus-daemon on PATH for a private session bus" }
+            (this as JavaExec).environment("DBUS_SESSION_BUS_ADDRESS", bus.get().address)
+        }
+    }
+}
+
+tasks.check {
+    dependsOn(sniHostTest, macSmokeCheck)
+}
+
+tasks.withType<Jar>().configureEach {
+    manifest {
+        attributes(
+            "Implementation-Title" to "libtray",
+            "Implementation-Version" to project.version,
+            "Implementation-Vendor" to "Kitty-Hivens",
+        )
+    }
+}
+
+// Maven Central publishing via the vanniktech plugin (new Central Portal,
+// central.sonatype.com). It builds the sources + javadoc jars, signs every
+// artifact, assembles the deployment bundle, and uploads it to the Central
+// Portal Publisher API.
+//
+// Secrets come from ~/.gradle/gradle.properties or env -- NEVER commit them:
+//   mavenCentralUsername / mavenCentralPassword : Central Portal user token
+//       (Central Portal -> Account -> Generate User Token), NOT the login.
+//   signingInMemoryKey / signingInMemoryKeyPassword (+ optional ...KeyId) :
+//       the ASCII-armored GPG private key + its passphrase.
+//
+// Publish: push a vX.Y.Z tag and .github/workflows/publish.yml does the rest,
+// passing the tag as -PappVersion and signing with the key CI holds. From a
+// workstation the same release is `./gradlew publishToMavenCentral
+// -PappVersion=X.Y.Z --no-configuration-cache`, signing through the keyring.
+// Pass the version either way: gradle.properties pins appVersion to a
+// SNAPSHOT, so the git-describe fallback above never gets to run.
+// automaticRelease then carries the deployment all the way through instead of
+// leaving it VALIDATED in the portal waiting for a manual Publish click.
+mavenPublishing {
+    // Central Portal (central.sonatype.com). Legacy OSSRH was removed in
+    // recent plugin versions, so this targets the portal.
+    publishToMavenCentral(automaticRelease = true)
+    signAllPublications()
+    coordinates("dev.hivens", "libtray", project.version.toString())
+    pom {
+        name.set("libtray")
+        description.set("Cross-platform system tray for JVM 22+ via Project Panama.")
+        url.set("https://github.com/Kitty-Hivens/libtray")
+        licenses {
+            license {
+                name.set("Apache-2.0")
+                url.set("https://www.apache.org/licenses/LICENSE-2.0.txt")
+            }
+        }
+        developers {
+            developer {
+                id.set("kitty-hivens")
+                name.set("Kitty-Hivens")
+            }
+        }
+        scm {
+            url.set("https://github.com/Kitty-Hivens/libtray")
+            connection.set("scm:git:https://github.com/Kitty-Hivens/libtray.git")
+        }
+    }
+}
+
+signing {
+    // Local release signs through the gpg keyring: BouncyCastle's in-memory
+    // reader chokes on modern GnuPG secret-key exports ("checksum mismatch"),
+    // so we hand signing to the gpg command. CI can still inject an in-memory
+    // key via signingInMemoryKey (vanniktech handles that), in which case we
+    // leave signing to it and skip useGpgCmd.
+    if (!providers.gradleProperty("signingInMemoryKey").isPresent &&
+        System.getenv("ORG_GRADLE_PROJECT_signingInMemoryKey") == null
+    ) {
+        useGpgCmd()
+    }
+}

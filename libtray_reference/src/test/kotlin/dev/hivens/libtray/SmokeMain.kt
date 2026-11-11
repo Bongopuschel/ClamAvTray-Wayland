@@ -1,0 +1,182 @@
+package dev.hivens.libtray
+
+import dev.hivens.libtray.macos.ObjcBindings
+import java.awt.Color
+import java.awt.image.BufferedImage
+import java.io.ByteArrayOutputStream
+import java.lang.foreign.MemorySegment
+import javax.imageio.ImageIO
+
+/**
+ * Manual smoke for the tray backend. Run via `./gradlew runSmoke` —
+ * shows a 32x32 tray icon, prints click events to stdout. Ctrl-C to exit.
+ *
+ * Used by the maintainer to eyeball each platform's backend before we
+ * have CI infrastructure that can probe the OS's tray host. Not a unit
+ * test — it's interactive.
+ *
+ * **Validation checklist** (use this as a script when you bring up a
+ * fresh platform or sanity-check after a backend change):
+ *
+ *   1. Run `./gradlew runSmoke` (or `gradlew.bat runSmoke` on Windows).
+ *      Stdout should print "tray live" within a couple of seconds.
+ *   2. Look at your system tray / notification area. A purple circle
+ *      icon should appear with a black "i"-shaped glyph.
+ *   3. Hover the icon. Tooltip should read "libtray smoke test".
+ *   4. Left-click the icon. Stdout should print
+ *      `[smoke] event: Activated (left click)`. On macOS a left click opens
+ *      the menu instead, unless the harness runs with
+ *      `LIBTRAY_SMOKE_MAC_ACTIVATE=1`, which sets
+ *      `macosMenuOnPrimaryClick = false`.
+ *   5. Right-click the icon (also Control-click or, by default, left-click
+ *      on macOS). A two-item menu should
+ *      appear: "Click me (noop)" + "Exit", separated by a horizontal line.
+ *   6. Middle-click the icon. Stdout should print
+ *      `[smoke] event: MiddleActivated`.
+ *   7. Open the menu again and click "Click me (noop)". Stdout should print
+ *      `[smoke] event: MenuItemSelected id=noop`.
+ *   8. Open the menu again, click "Exit". Stdout should print
+ *      `id=exit` and the program should terminate cleanly.
+ *
+ * Per-OS prerequisites covered in the failure message below.
+ */
+fun main() {
+    println("libtray smoke — building 32x32 PNG icon in memory...")
+    val img = BufferedImage(32, 32, BufferedImage.TYPE_INT_ARGB).apply {
+        val g = createGraphics()
+        try {
+            // Solid magenta circle on transparent background — easy to
+            // spot in any tray theme.
+            g.color = Color(0xBB, 0x86, 0xFC)
+            g.fillOval(2, 2, 28, 28)
+            g.color = Color.BLACK
+            g.fillRect(14, 12, 4, 8)
+            g.fillRect(14, 22, 4, 4)
+        } finally {
+            g.dispose()
+        }
+    }
+    val pngBytes = ByteArrayOutputStream().also { ImageIO.write(img, "PNG", it) }.toByteArray()
+
+    println("libtray smoke — opening tray as 'libtray-smoke'...")
+    val tray = Tray.create(
+        TrayBuilder(
+            title = "libtray-smoke",
+            iconBytes = pngBytes,
+            tooltip = "libtray smoke test",
+            menu = TrayMenu(listOf(
+                TrayMenuItem.Standard(id = "noop", label = "Click me (noop)"),
+                TrayMenuItem.Separator,
+                TrayMenuItem.Standard(id = "exit", label = "Exit"),
+            )),
+            macosMenuOnPrimaryClick = System.getenv("LIBTRAY_SMOKE_MAC_ACTIVATE") != "1",
+        ),
+    ) ?: run {
+        val os = System.getProperty("os.name", "").lowercase()
+        val hint = when {
+            os.contains("linux") || os.contains("bsd") ->
+                "Linux: libdbus + session bus + StatusNotifierWatcher must all be reachable. " +
+                "Check DISPLAY / WAYLAND_DISPLAY and DBUS_SESSION_BUS_ADDRESS are set, and that " +
+                "some component provides the SNI watcher (KDE plasmashell, GNOME's SNI extension, " +
+                "waybar's tray module on Hyprland)."
+            os.contains("windows") ->
+                "Windows: kernel32/user32/shell32/gdi32 must load (they always do on Windows; null " +
+                "here means a Panama upcall stub or RegisterClassExW failed — check the JVM has " +
+                "--enable-native-access=ALL-UNNAMED and is JDK 22+)."
+            os.contains("mac") || os.contains("darwin") ->
+                "macOS: the status item must be created on the Cocoa main thread (OS thread 0). " +
+                "`./gradlew runSmoke` already passes -XstartOnFirstThread; null here usually means " +
+                "AppKit / libobjc did not load, or Tray.create ran off the main thread."
+            else -> "Unrecognised OS: $os. libtray supports Linux, Windows, macOS."
+        }
+        System.err.println("Tray.create returned null. $hint")
+        kotlin.system.exitProcess(1)
+    }
+
+    val exitFlag = java.util.concurrent.CountDownLatch(1)
+
+    tray.onEvent { event ->
+        // Runs on the tray's libtray-events thread, where printing is safe.
+        // To touch UI, register with onEvent(executor, listener) instead.
+        when (event) {
+            is TrayEvent.Activated         -> println("[smoke] event: Activated (left click)")
+            is TrayEvent.MiddleActivated   -> println("[smoke] event: MiddleActivated")
+            is TrayEvent.MenuRequested     -> println("[smoke] event: MenuRequested")
+            is TrayEvent.MenuItemSelected  -> {
+                println("[smoke] event: MenuItemSelected id=${event.id}")
+                if (event.id == "exit") exitFlag.countDown()
+            }
+        }
+    }
+
+    Runtime.getRuntime().addShutdownHook(Thread {
+        println("[smoke] shutdown hook → tray.close()")
+        runCatching { tray.close() }
+    })
+
+    println("[smoke] tray live. Click / right-click / Ctrl-C to test. Tray will stay until SIGINT.")
+
+    val osName = System.getProperty("os.name", "").lowercase()
+    if (osName.contains("mac") || osName.contains("darwin")) {
+        runMacCocoaLoopUntil(exitFlag) { tray.close() }
+    } else {
+        exitFlag.await()  // Ctrl-C handler in the JDK delivers SIGINT → JVM exit → shutdown hook
+        tray.close()
+    }
+}
+
+/**
+ * macOS-only smoke harness exit path. NSStatusItem registration uses
+ * mach IPC to talk to SystemUIServer, and the replies are dispatched
+ * via the Cocoa main run loop — without an active loop the icon
+ * exists in our process but never paints. AWT EDT does not satisfy
+ * Cocoa: a JVM launched with `-XstartOnFirstThread` runs `main` on
+ * OS thread 0, which IS the Cocoa main thread, and we have to keep
+ * it pumping with `[NSApp run]` until the user picks "Exit".
+ *
+ * Architecture:
+ *  - Background watcher waits on [exitFlag] (fired by the menu "Exit"
+ *    handler). On wake, it closes the tray, then sends `terminate:`
+ *    to NSApp which lets the run loop return cleanly.
+ *  - Main thread enters `[NSApp run]` — blocks here until terminate.
+ *
+ * A Compose Desktop / Skiko application doesn't need this code path:
+ * it owns the Cocoa main loop already.
+ */
+private fun runMacCocoaLoopUntil(
+    exitFlag: java.util.concurrent.CountDownLatch,
+    closeTray: () -> Unit,
+) {
+    val bindings = ObjcBindings.load() ?: run {
+        System.err.println("[smoke] ObjcBindings.load() failed on macOS — cannot run Cocoa loop")
+        exitFlag.await()
+        closeTray()
+        return
+    }
+    val nsAppCls = bindings.cls("NSApplication")
+    val sharedApp = bindings.handle("objc_msgSend_id")
+        .invokeExact(nsAppCls, bindings.sel("sharedApplication")) as MemorySegment
+
+    Thread({
+        exitFlag.await()
+        println("[smoke] exitFlag tripped → close tray + [NSApp terminate:]")
+        runCatching { closeTray() }
+        runCatching {
+            bindings.handle("objc_msgSend_void_id").invokeExact(
+                sharedApp, bindings.sel("terminate:"), MemorySegment.NULL,
+            ) as Unit
+        }
+    }, "libtray-smoke-exit-watcher").apply {
+        isDaemon = false
+        start()
+    }
+
+    println("[smoke] entering [NSApp run] on main thread")
+    bindings.handle("objc_msgSend_void").invokeExact(
+        sharedApp, bindings.sel("run"),
+    ) as Unit
+    // [NSApp terminate:] calls exit() under the hood; this point is
+    // typically unreachable. Kept for the (theoretical) case where a
+    // future NSApplicationDelegate vetoes termination.
+    println("[smoke] [NSApp run] returned")
+}

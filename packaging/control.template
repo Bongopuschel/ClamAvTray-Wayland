@@ -1,0 +1,11 @@
+Package: clamav-tray
+Version: @VERSION@
+Section: utils
+Priority: optional
+Architecture: @ARCH@
+Maintainer: Lokaler Paketbau <local@localhost>
+Depends: clamav, clamav-daemon, clamav-freshclam, clamdscan, kdialog, libnotify-bin, pkexec, libdbus-1-3, libfontconfig1, libfreetype6, bash
+Description: Inoffizielle ClamAV-Statusanzeige fuer KDE Plasma
+ Zeigt die laufenden ClamAV-Dienste, Signaturstand und Virenfunde an.
+ Bietet eine native KDE-Datei-/Ordnerauswahl fuer manuelle Scans.
+ Enthaelt eine eigene, mit jlink erstellte Java-25-Laufzeit.
