@@ -1,5 +1,7 @@
 # ClamAV Tray für Debian 13 und KDE Plasma (Wayland)
 
+![Screenshot](trayIcon.png)
+
 Inoffizielle Statusanzeige für eine bestehende ClamAV-Installation. Das Tray
 zeigt den Status von `clamav-daemon`, `clamav-freshclam` und
 `clamav-clamonacc`, die geladenen Signaturen und Virenfunde. Du kannst
